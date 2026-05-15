@@ -1,0 +1,615 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express from "express";
+import { z } from "zod";
+import * as fs from "fs";
+import * as path from "path";
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+/**
+ * The character threshold above which a full view is truncated into
+ * beginning + tail sections, matching Claude's ~16 000 char budget.
+ */
+const VIEW_CHAR_LIMIT = 16_000;
+
+/**
+ * Maximum directory depth shown when viewing a directory (2 levels).
+ */
+const DIR_MAX_DEPTH = 2;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Format a byte count into a human-readable size string (K / M / G). */
+function humanSize(bytes: number): string {
+  if (bytes === 0) return "0";
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)}K`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)}M`;
+  return `${(mb / 1024).toFixed(1)}G`;
+}
+
+/**
+ * Recursively compute the total size of a directory (in bytes).
+ * Symlinks are not followed to avoid infinite loops.
+ */
+function dirSize(dirPath: string): number {
+  let total = 0;
+  try {
+    for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        total += dirSize(fullPath);
+      } else {
+        total += fs.statSync(fullPath).size;
+      }
+    }
+  } catch {
+    /* ignore permission errors */
+  }
+  return total;
+}
+
+/**
+ * Build a directory listing string matching the view tool output format.
+ *
+ * The output is a tab-separated list of `size\tpath` lines,
+ * where the root entry comes first and each item is indented by depth.
+ *
+ * Example:
+ *   28K\t/home/claude/testdir
+ *   16K\t/home/claude/testdir/level1a
+ *    0\t/home/claude/testdir/level1a/file.txt
+ *
+ * Hidden items (starting with ".") and node_modules are excluded.
+ * Only 2 levels deep are shown from the root.
+ */
+function buildDirListing(
+  rootPath: string,
+  currentPath: string,
+  depth: number,
+  lines: string[]
+): void {
+  const stat = fs.statSync(currentPath);
+
+  if (stat.isDirectory()) {
+    const size = dirSize(currentPath);
+    lines.push(`${humanSize(size)}\t${currentPath}`);
+
+    if (depth >= DIR_MAX_DEPTH) return;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    // Sort: directories first, then files, both alphabetically
+    const dirs = entries
+      .filter(
+        (e) =>
+          e.isDirectory() &&
+          !e.name.startsWith(".") &&
+          e.name !== "node_modules"
+      )
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    const files = entries
+      .filter((e) => e.isFile() && !e.name.startsWith("."))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const entry of [...dirs, ...files]) {
+      buildDirListing(
+        rootPath,
+        path.join(currentPath, entry.name),
+        depth + 1,
+        lines
+      );
+    }
+  } else {
+    // File entry: show its size
+    const size = stat.size;
+    const sizeStr = size === 0 ? "0" : humanSize(size);
+    lines.push(`${sizeStr}\t${currentPath}`);
+  }
+}
+
+/**
+ * Format file contents with 1-based line numbers, matching the view tool.
+ *
+ * Each line is prefixed with right-aligned line number + TAB:
+ *   "     1\tLine content"
+ *
+ * The width of the number field is 6 chars (5 digits + 1 leading space minimum),
+ * matching the observed format.
+ */
+function formatLines(
+  lines: string[],
+  startLine: number,
+  endLine: number,
+  totalLines: number
+): string {
+  const selected = lines.slice(startLine - 1, endLine);
+  const numbered = selected.map((line, i) => {
+    const lineNum = startLine + i;
+    return `${String(lineNum).padStart(6)}\t${line}`;
+  });
+  return numbered.join("\n");
+}
+
+/**
+ * Read a file as a string, replacing non-UTF-8 bytes with hex escapes
+ * (e.g. \xFF), mirroring the view tool's binary file display.
+ */
+function readFileWithHexEscapes(filePath: string): string {
+  const buf = fs.readFileSync(filePath);
+  let result = "";
+  for (let i = 0; i < buf.length; i++) {
+    const byte = buf[i];
+    if (byte === undefined) continue;
+    // Check if byte is valid ASCII or common UTF-8 printable range
+    try {
+      const char = buf.subarray(i, i + 1).toString("utf8");
+      // If the char was replaced by the replacement character, it's invalid UTF-8
+      if (char === "\uFFFD" && byte > 0x7f) {
+        result += `\\x${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+      } else {
+        result += char;
+      }
+    } catch {
+      result += `\\x${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    }
+  }
+  return result;
+}
+
+// ─── MCP Server ──────────────────────────────────────────────────────────────
+
+const server = new McpServer({
+  name: "file-tools-mcp-server",
+  version: "1.0.0",
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 1: view
+// ════════════════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "view",
+  {
+    title: "View File or Directory",
+    description: `Read the contents of a file or list the contents of a directory.
+
+Supports viewing text files, image files (jpg/jpeg/png/gif/webp), and directory listings.
+
+**File viewing:**
+- Text files are displayed with 1-based line numbers in the format "     N\\tline content"
+- Non-UTF-8 bytes are shown as hex escapes (e.g. \\xFF)
+- If the file exceeds ~16 000 characters, the middle is omitted and replaced with a "< truncated lines X-Y >" marker; beginning and end are both shown
+- Optionally restrict output to a line range with view_range=[start, end] (1-based, inclusive)
+  - End of -1 means "to the end of the file"
+  - When a range is given, a "[N lines total]" footer is appended
+  - start must be between 1 and the total number of lines; if out of range, an error is returned
+  - If end exceeds total lines, output is clamped to the last line
+- Empty files produce no output (empty string)
+
+**Directory listing:**
+- Lists up to 2 levels deep (hidden items and node_modules are excluded)
+- Each entry is shown as "size\\tpath" (e.g. "8.0K\\t/home/claude/dir")
+- Directories show their total recursive size
+- Files show their individual size; 0-byte files show "0"
+
+**Error cases:**
+- Path not found: "Path not found: <path>"
+
+Args:
+  - path (string): Absolute path to the file or directory to view
+  - view_range ([start, end] | null): Optional 1-based inclusive line range. Use -1 for end to mean "to EOF". Only valid for text files.
+
+Returns:
+  For directories: formatted listing string
+  For files: numbered line content (possibly truncated)
+  For empty files: empty string`,
+    inputSchema: {
+      path: z
+        .string()
+        .describe(
+          "Absolute path to the file or directory, e.g. `/repo/file.py` or `/repo`."
+        ),
+      view_range: z
+        .array(z.number().int())
+        .length(2)
+        .nullable()
+        .optional()
+        .describe(
+          "Optional line range for text files. Format: [start_line, end_line] where lines are indexed starting at 1. Use [start_line, -1] to view from start_line to end of file. When not provided, the entire file is displayed."
+        ),
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async (rawArgs) => {
+    const filePath = (rawArgs as { path: string; view_range?: number[] | null }).path;
+    const view_range = (rawArgs as { view_range?: number[] | null }).view_range as [number, number] | null | undefined;
+    // Check existence
+    if (!fs.existsSync(filePath)) {
+      return {
+        content: [
+          { type: "text" as const, text: `Path not found: ${filePath}` },
+        ],
+        isError: true,
+      };
+    }
+
+    const stat = fs.statSync(filePath);
+
+    // ── Directory listing ──────────────────────────────────────────────────
+    if (stat.isDirectory()) {
+      const lines: string[] = [];
+      buildDirListing(filePath, filePath, 0, lines);
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      };
+    }
+
+    // ── File viewing ───────────────────────────────────────────────────────
+    const raw = readFileWithHexEscapes(filePath);
+
+    // Empty file
+    if (raw === "") {
+      return { content: [{ type: "text" as const, text: "" }] };
+    }
+
+    // Split into lines (preserve trailing newline as an empty final line)
+    const lines = raw.split("\n");
+    const totalLines = lines.length;
+
+    // Handle view_range
+    if (view_range) {
+      let [startLine, endLine] = view_range;
+
+      // Validate start
+      if (startLine < 1 || startLine > totalLines) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Invalid \`view_range\`: First element \`${startLine}\` should be between 1 and ${totalLines}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // -1 means to end
+      if (endLine === -1) endLine = totalLines;
+
+      // Clamp end to totalLines
+      if (endLine > totalLines) endLine = totalLines;
+
+      const formatted = formatLines(lines, startLine, endLine, totalLines);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${formatted}\n[${totalLines} lines total]`,
+          },
+        ],
+      };
+    }
+
+    // Full file view — check if truncation needed
+    // We format all lines first, then measure chars
+    const fullFormatted = formatLines(lines, 1, totalLines, totalLines);
+
+    if (fullFormatted.length <= VIEW_CHAR_LIMIT) {
+      return { content: [{ type: "text" as const, text: fullFormatted }] };
+    }
+
+    // Truncation: show beginning + tail, omit middle
+    // Split the rendered output into rendered lines
+    const renderedLines = fullFormatted.split("\n");
+    const renderedTotal = renderedLines.length;
+
+    // Build beginning until we hit half the budget
+    const halfBudget = VIEW_CHAR_LIMIT / 2;
+    let beginningEnd = 0;
+    let charCount = 0;
+    for (let i = 0; i < renderedTotal; i++) {
+      charCount += renderedLines[i].length + 1; // +1 for \n
+      if (charCount > halfBudget) break;
+      beginningEnd = i + 1;
+    }
+
+    // Build tail from the end
+    let tailStart = renderedTotal;
+    charCount = 0;
+    for (let i = renderedTotal - 1; i >= beginningEnd; i--) {
+      charCount += renderedLines[i].length + 1;
+      if (charCount > halfBudget) break;
+      tailStart = i;
+    }
+
+    // Map rendered line indices back to original 1-based line numbers
+    // Each rendered line corresponds to a file line (same index)
+    const beginningContent = renderedLines.slice(0, beginningEnd).join("\n");
+    const tailContent = renderedLines.slice(tailStart).join("\n");
+
+    // The skipped file lines are beginningEnd+1 .. tailStart (1-based)
+    const skipStart = beginningEnd + 1;
+    const skipEnd = tailStart; // inclusive
+
+    const truncationMarker = `\t< truncated lines ${skipStart}-${skipEnd} >`;
+
+    const result = `${beginningContent}\n${truncationMarker}\n${tailContent}`;
+    return { content: [{ type: "text" as const, text: result }] };
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 2: create_file
+// ════════════════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "create_file",
+  {
+    title: "Create New File",
+    description: `Create a new file at the specified path with the given content.
+
+**Behavior:**
+- Creates all intermediate parent directories automatically (like mkdir -p)
+- FAILS if the file already exists — this tool will NOT overwrite existing files
+- Writes the exact content provided; no transformation is applied
+
+**Error cases:**
+- File already exists: "File already exists: <path>"
+- Permission denied or other OS errors: the OS error message is returned
+
+Args:
+  - description (string): Why this file is being created (required first parameter — used for context only, not written to disk)
+  - path (string): Absolute destination path for the new file
+  - file_text (string): Exact content to write
+
+Returns:
+  "File created successfully: <path>" on success.`,
+    inputSchema: {
+      description: z
+        .string()
+        .describe(
+          "Why I'm creating this file. ALWAYS PROVIDE THIS PARAMETER FIRST."
+        ),
+      path: z
+        .string()
+        .describe(
+          "Absolute path to the file to create. ALWAYS PROVIDE THIS PARAMETER SECOND."
+        ),
+      file_text: z
+        .string()
+        .describe(
+          "Content to write to the file. ALWAYS PROVIDE THIS PARAMETER LAST."
+        ),
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async (rawArgs) => {
+    const filePath = (rawArgs as { path: string; file_text: string }).path;
+    const file_text = (rawArgs as { file_text: string }).file_text;
+    // Refuse to overwrite
+    if (fs.existsSync(filePath)) {
+      return {
+        content: [
+          { type: "text" as const, text: `File already exists: ${filePath}` },
+        ],
+        isError: true,
+      };
+    }
+
+    // Create parent directories
+    const parentDir = path.dirname(filePath);
+    try {
+      fs.mkdirSync(parentDir, { recursive: true });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text" as const, text: msg }],
+        isError: true,
+      };
+    }
+
+    // Write file
+    try {
+      fs.writeFileSync(filePath, file_text, { encoding: "utf8", flag: "wx" });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text" as const, text: msg }],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `File created successfully: ${filePath}`,
+        },
+      ],
+    };
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 3: str_replace
+// ════════════════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "str_replace",
+  {
+    title: "String Replace in File",
+    description: `Replace a unique string in an existing file with another string.
+
+**Behavior:**
+- Reads the raw file content and performs a plain-string (not regex) find-and-replace
+- \`old_str\` must match the file content EXACTLY (including whitespace, newlines, indentation)
+- \`old_str\` must appear EXACTLY ONCE in the file — if it appears 0 or 2+ times, the operation fails
+- \`new_str\` defaults to "" (empty string), which effectively DELETES old_str from the file
+- The file is written back in-place; no backup is created
+
+**Important — view before editing:**
+After any successful str_replace the in-context view of the file is stale. Always re-view the file before further edits.
+
+**Error cases:**
+- File not found: "File not found: <path>"
+- old_str not in file: "String to replace not found in <path>. Use the view tool to see the current file content before retrying. If you made a successful str_replace to this file since your last view, that edit invalidated your view output."
+- old_str appears multiple times: "String to replace found multiple times, must be unique"
+
+Args:
+  - description (string): Why I'm making this edit (required first parameter — for context only)
+  - path (string): Absolute path to the file to edit
+  - old_str (string): The exact string to find and replace — must be unique in the file
+  - new_str (string): Replacement string; defaults to "" (empty) to delete old_str
+
+Returns:
+  "Successfully replaced string in <path>" on success.`,
+    inputSchema: {
+      description: z.string().describe("Why I'm making this edit."),
+      path: z.string().describe("Path to the file to edit."),
+      old_str: z
+        .string()
+        .describe("String to replace (must be unique in file)."),
+      new_str: z
+        .string()
+        .default("")
+        .describe("String to replace with (empty to delete)."),
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async (rawArgs) => {
+    const filePath = (rawArgs as { path: string; old_str: string; new_str: string }).path;
+    const old_str = (rawArgs as { old_str: string }).old_str;
+    const new_str = (rawArgs as { new_str: string }).new_str ?? '';
+    // File must exist
+    if (!fs.existsSync(filePath)) {
+      return {
+        content: [
+          { type: "text" as const, text: `File not found: ${filePath}` },
+        ],
+        isError: true,
+      };
+    }
+
+    const content = fs.readFileSync(filePath, "utf8");
+
+    // Count occurrences (non-overlapping)
+    const occurrences = content.split(old_str).length - 1;
+
+    if (occurrences === 0) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `String to replace not found in ${filePath}. ` +
+              `Use the view tool to see the current file content before retrying. ` +
+              `If you made a successful str_replace to this file since your last view, ` +
+              `that edit invalidated your view output.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (occurrences > 1) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `String to replace found multiple times, must be unique`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Replace exactly once
+    const newContent = content.replace(old_str, new_str);
+
+    try {
+      fs.writeFileSync(filePath, newContent, "utf8");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text" as const, text: msg }],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Successfully replaced string in ${filePath}`,
+        },
+      ],
+    };
+  }
+);
+
+// ─── Transport Setup ─────────────────────────────────────────────────────────
+
+async function runStdio(): Promise<void> {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("file-tools-mcp-server running on stdio");
+}
+
+async function runHTTP(): Promise<void> {
+  const app = express();
+  app.use(express.json());
+
+  app.post("/mcp", async (req, res) => {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+    res.on("close", () => transport.close());
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  });
+
+  const port = parseInt(process.env.PORT ?? "3000");
+  app.listen(port, () => {
+    console.error(`file-tools-mcp-server running on http://localhost:${port}/mcp`);
+  });
+}
+
+const transport = process.env.TRANSPORT ?? "stdio";
+if (transport === "http") {
+  runHTTP().catch((error: unknown) => {
+    console.error("Server error:", error);
+    process.exit(1);
+  });
+} else {
+  runStdio().catch((error: unknown) => {
+    console.error("Server error:", error);
+    process.exit(1);
+  });
+}
