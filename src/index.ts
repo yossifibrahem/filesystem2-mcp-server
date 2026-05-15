@@ -5,6 +5,7 @@ import express from "express";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
+import { execFile as execFileCallback, ExecFileException } from "child_process";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -261,6 +262,32 @@ Returns:
     }
 
     // ── File viewing ───────────────────────────────────────────────────────
+
+    // Check if this is an image file — return as image content block
+    const imageExts = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+    const ext = path.extname(filePath).toLowerCase();
+    if (imageExts.has(ext)) {
+      const mimeMap: Record<string, string> = {
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+      };
+      const imageData = fs.readFileSync(filePath);
+      const base64Data = imageData.toString('base64');
+      const mediaType = mimeMap[ext] ?? 'image/png';
+      return {
+        content: [
+          {
+            type: 'image' as const,
+            data: base64Data,
+            mimeType: mediaType,
+          },
+        ],
+      };
+    }
+
     const raw = readFileWithHexEscapes(filePath);
 
     // Empty file
@@ -567,6 +594,84 @@ Returns:
         {
           type: "text" as const,
           text: `Successfully replaced string in ${filePath}`,
+        },
+      ],
+    };
+  }
+);
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 4: bash_tool
+// ════════════════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  'bash_tool',
+  {
+    title: 'Run Bash Command',
+    description: `Run a bash command and return its stdout, stderr, and exit code.
+
+**Behavior:**
+- Each call is a fresh bash process — environment variables, working directory, and shell state do NOT persist between calls
+- stdout and stderr are captured separately and returned in full (no truncation)
+- The return code is the exit code of the last command in the script
+- Supports multi-line commands, pipes, subshells, heredocs, and all standard bash features
+- Binary output bytes are returned as-is in the stdout string
+- Unicode (UTF-8) is supported natively
+
+**What does NOT persist between calls:**
+- Environment variables set with export
+- Working directory changes (cd)
+- Shell functions or aliases defined in a previous call
+
+**Returns JSON with three fields:**
+  {
+    returncode: number,   // exit code (0 = success)
+    stdout: string,       // everything written to stdout
+    stderr: string        // everything written to stderr
+  }
+
+Args:
+  - command (string): The bash script to execute
+  - description (string): Why this command is being run (context only, not executed)`,
+    inputSchema: {
+      command: z.string().describe('Bash command to run'),
+      description: z.string().describe('Why I am running this command'),
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (rawArgs) => {
+    const command = (rawArgs as { command: string }).command;
+
+    const result = await new Promise<{ returncode: number; stdout: string; stderr: string }>(
+      (resolve) => {
+        execFileCallback(
+          'bash',
+          ['-c', command],
+          { encoding: 'buffer', maxBuffer: 100 * 1024 * 1024, cwd: '/' },
+          (error: ExecFileException | null, stdoutBuf: Buffer, stderrBuf: Buffer) => {
+            const returncode =
+              error && 'code' in error && typeof error.code === 'number'
+                ? error.code
+                : 0;
+            const stdout = stdoutBuf.toString('utf8');
+            const stderr = stderrBuf.toString('utf8');
+            resolve({ returncode, stdout, stderr });
+          }
+        );
+      }
+    );
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(result),
         },
       ],
     };
