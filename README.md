@@ -1,6 +1,6 @@
 # file-tools-mcp-server
 
-An MCP server that faithfully replicates Claude's three built-in computer-use tools — **`view`**, **`create_file`**, and **`str_replace`** — as standard MCP tools any LLM client can call.
+An MCP server that faithfully replicates Claude's four built-in computer-use tools — **`view`**, **`create_file`**, **`str_replace`**, and **`bash_tool`** — as standard MCP tools any LLM client can call.
 
 Reverse-engineered from live tool behaviour, verified with a 57-test suite (0 failures).
 
@@ -53,6 +53,49 @@ Replace a unique string in a file. Fails if the string appears 0 or 2+ times.
 | `path` | string | ✅ | Absolute path to the file |
 | `old_str` | string | ✅ | Exact string to find (must appear exactly once) |
 | `new_str` | string | ❌ | Replacement (defaults to `""` — deletes `old_str`) |
+
+---
+
+### `bash_tool`
+Run a bash command and return its stdout, stderr, and exit code.
+
+**Arguments**
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `command` | string | ✅ | The bash script to execute |
+| `description` | string | ✅ | Reason for running (context only, not executed) |
+
+**Returns**
+
+A JSON object with three fields:
+
+```json
+{
+  "returncode": 0,
+  "stdout": "...",
+  "stderr": "..."
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `returncode` | number | Exit code (0 = success) |
+| `stdout` | string | Everything written to stdout |
+| `stderr` | string | Everything written to stderr |
+
+**Behaviour**
+
+- Each call is a **fresh bash process** — environment variables, working directory, and shell state do **not** persist between calls
+- stdout and stderr are captured separately and returned in full (no truncation; up to 100 MB buffer)
+- Supports multi-line commands, pipes, subshells, heredocs, and all standard bash features
+- Binary output is returned as-is; UTF-8 Unicode is supported natively
+
+**What does NOT persist between calls**
+
+- Environment variables set with `export`
+- Working directory changes (`cd`)
+- Shell functions or aliases defined in a previous call
 
 ---
 
