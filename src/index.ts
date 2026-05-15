@@ -208,6 +208,7 @@ Supports viewing text files, image files (jpg/jpeg/png/gif/webp), and directory 
 - Path not found: "Path not found: <path>"
 
 Args:
+  - description (string): Why this file or directory is being viewed (required first parameter — for context only, not written to disk)
   - path (string): Absolute path to the file or directory to view
   - view_range ([start, end] | null): Optional 1-based inclusive line range. Use -1 for end to mean "to EOF". Only valid for text files.
 
@@ -216,6 +217,9 @@ Returns:
   For files: numbered line content (possibly truncated)
   For empty files: empty string`,
     inputSchema: {
+      description: z
+        .string()
+        .describe("Why I need to view this file or directory. ALWAYS PROVIDE THIS PARAMETER FIRST."),
       path: z
         .string()
         .describe(

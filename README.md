@@ -24,6 +24,7 @@ Read a file or list a directory.
 
 | Param | Type | Required | Description |
 |---|---|---|---|
+| `description` | string | ✅ | Reason for viewing (context only, not written to disk) |
 | `path` | string | ✅ | Absolute path to file or directory |
 | `view_range` | `[number, number]` | ❌ | Line range (1-based, -1 for EOF) |
 
