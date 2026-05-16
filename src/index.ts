@@ -145,24 +145,27 @@ function formatLines(
 /**
  * Read a file as a string, replacing non-UTF-8 bytes with hex escapes
  * (e.g. \xFF), mirroring the view tool's binary file display.
+ *
+ * TextDecoder (fatal: false) already handles multi-byte sequences correctly,
+ * emitting U+FFFD for each invalid byte. We walk the buffer and decoded string
+ * in parallel: valid chars are copied as-is; each U+FFFD means the current
+ * buffer byte was invalid, so we emit a hex escape and advance by one byte.
  */
 function readFileWithHexEscapes(filePath: string): string {
   const buf = fs.readFileSync(filePath);
+  const decoded = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+  if (!decoded.includes("\uFFFD")) return decoded;
+
+  const encoder = new TextEncoder();
   let result = "";
-  for (let i = 0; i < buf.length; i++) {
-    const byte = buf[i];
-    if (byte === undefined) continue;
-    // Check if byte is valid ASCII or common UTF-8 printable range
-    try {
-      const char = buf.subarray(i, i + 1).toString("utf8");
-      // If the char was replaced by the replacement character, it's invalid UTF-8
-      if (char === "\uFFFD" && byte > 0x7f) {
-        result += `\\x${byte.toString(16).toUpperCase().padStart(2, "0")}`;
-      } else {
-        result += char;
-      }
-    } catch {
-      result += `\\x${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  let bufPos = 0;
+  for (const char of decoded) {
+    if (char === "\uFFFD") {
+      result += `\\x${buf[bufPos]!.toString(16).toUpperCase().padStart(2, "0")}`;
+      bufPos += 1;
+    } else {
+      result += char;
+      bufPos += encoder.encode(char).length;
     }
   }
   return result;
@@ -514,8 +517,9 @@ server.registerTool(
       };
     }
 
-    // Replace exactly once
-    const newContent = content.replace(old_str, new_str);
+    // Replace exactly once — use split/join to avoid String.replace() interpreting
+    // special patterns like $&, $`, $', $1 in new_str.
+    const newContent = content.split(old_str).join(new_str);
 
     try {
       fs.writeFileSync(filePath, newContent, "utf8");
