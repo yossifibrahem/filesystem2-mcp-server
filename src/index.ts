@@ -183,39 +183,14 @@ server.registerTool(
   "view",
   {
     title: "View File or Directory",
-    description: `Read the contents of a file or list the contents of a directory.
+    description: `Supports viewing text, images, and directory listings.
 
-Supports viewing text files, image files (jpg/jpeg/png/gif/webp), and directory listings.
+Supported path types:
+- Directories: Lists files and directories up to 2 levels deep, ignoring hidden items and node_modules
+- Image files (.jpg, .jpeg, .png, .gif, .webp): Displays the image visually
+- Text files: Displays numbered lines (prefix \`    N\\t\` is display-only — do not include it in str_replace's \`old_str\`). You can optionally specify a view_range to see specific lines.
 
-**File viewing:**
-- Text files are displayed with 1-based line numbers in the format "     N\\tline content"
-- Non-UTF-8 bytes are shown as hex escapes (e.g. \\xFF)
-- If the file exceeds ~16 000 characters, the middle is omitted and replaced with a "< truncated lines X-Y >" marker; beginning and end are both shown
-- Optionally restrict output to a line range with view_range=[start, end] (1-based, inclusive)
-  - End of -1 means "to the end of the file"
-  - When a range is given, a "[N lines total]" footer is appended
-  - start must be between 1 and the total number of lines; if out of range, an error is returned
-  - If end exceeds total lines, output is clamped to the last line
-- Empty files produce no output (empty string)
-
-**Directory listing:**
-- Lists up to 2 levels deep (hidden items and node_modules are excluded)
-- Each entry is shown as "size\\tpath" (e.g. "8.0K\\t/home/claude/dir")
-- Directories show their total recursive size
-- Files show their individual size; 0-byte files show "0"
-
-**Error cases:**
-- Path not found: "Path not found: <path>"
-
-Args:
-  - description (string): Why this file or directory is being viewed (required first parameter — for context only, not written to disk)
-  - path (string): Absolute path to the file or directory to view
-  - view_range ([start, end] | null): Optional 1-based inclusive line range. Use -1 for end to mean "to EOF". Only valid for text files.
-
-Returns:
-  For directories: formatted listing string
-  For files: numbered line content (possibly truncated)
-  For empty files: empty string`,
+Note: Files with non-UTF-8 encoding will display hex escapes (e.g. \\x84) for invalid bytes`,
     inputSchema: {
       description: z
         .string()
@@ -393,24 +368,7 @@ server.registerTool(
   "create_file",
   {
     title: "Create New File",
-    description: `Create a new file at the specified path with the given content.
-
-**Behavior:**
-- Creates all intermediate parent directories automatically (like mkdir -p)
-- FAILS if the file already exists — this tool will NOT overwrite existing files
-- Writes the exact content provided; no transformation is applied
-
-**Error cases:**
-- File already exists: "File already exists: <path>"
-- Permission denied or other OS errors: the OS error message is returned
-
-Args:
-  - description (string): Why this file is being created (required first parameter — used for context only, not written to disk)
-  - path (string): Absolute destination path for the new file
-  - file_text (string): Exact content to write
-
-Returns:
-  "File created successfully: <path>" on success.`,
+    description: `Create a new file with content in the container`,
     inputSchema: {
       description: z
         .string()
@@ -490,31 +448,7 @@ server.registerTool(
   "str_replace",
   {
     title: "String Replace in File",
-    description: `Replace a unique string in an existing file with another string.
-
-**Behavior:**
-- Reads the raw file content and performs a plain-string (not regex) find-and-replace
-- \`old_str\` must match the file content EXACTLY (including whitespace, newlines, indentation)
-- \`old_str\` must appear EXACTLY ONCE in the file — if it appears 0 or 2+ times, the operation fails
-- \`new_str\` defaults to "" (empty string), which effectively DELETES old_str from the file
-- The file is written back in-place; no backup is created
-
-**Important — view before editing:**
-After any successful str_replace the in-context view of the file is stale. Always re-view the file before further edits.
-
-**Error cases:**
-- File not found: "File not found: <path>"
-- old_str not in file: "String to replace not found in <path>. Use the view tool to see the current file content before retrying. If you made a successful str_replace to this file since your last view, that edit invalidated your view output."
-- old_str appears multiple times: "String to replace found multiple times, must be unique"
-
-Args:
-  - description (string): Why I'm making this edit (required first parameter — for context only)
-  - path (string): Absolute path to the file to edit
-  - old_str (string): The exact string to find and replace — must be unique in the file
-  - new_str (string): Replacement string; defaults to "" (empty) to delete old_str
-
-Returns:
-  "Successfully replaced string in <path>" on success.`,
+    description: `Replace a unique string in a file with another string. old_str must match the raw file content exactly and appear exactly once. When copying from view output, do NOT include the line number prefix (spaces + line number + tab) — it is display-only. View the file immediately before editing; after any successful str_replace, earlier view output of that file in your context is stale — re-view before further edits to the same file.`,
     inputSchema: {
       description: z.string().describe("Why I'm making this edit."),
       path: z.string().describe("Path to the file to edit."),
@@ -613,31 +547,7 @@ server.registerTool(
   'bash_tool',
   {
     title: 'Run Bash Command',
-    description: `Run a bash command and return its stdout, stderr, and exit code.
-
-**Behavior:**
-- Each call is a fresh bash process — environment variables, working directory, and shell state do NOT persist between calls
-- stdout and stderr are captured separately and returned in full (no truncation)
-- The return code is the exit code of the last command in the script
-- Supports multi-line commands, pipes, subshells, heredocs, and all standard bash features
-- Binary output bytes are returned as-is in the stdout string
-- Unicode (UTF-8) is supported natively
-
-**What does NOT persist between calls:**
-- Environment variables set with export
-- Working directory changes (cd)
-- Shell functions or aliases defined in a previous call
-
-**Returns JSON with three fields:**
-  {
-    returncode: number,   // exit code (0 = success)
-    stdout: string,       // everything written to stdout
-    stderr: string        // everything written to stderr
-  }
-
-Args:
-  - command (string): The bash script to execute
-  - description (string): Why this command is being run (context only, not executed)`,
+    description: `Run a bash command in the container`,
     inputSchema: {
       command: z.string().describe('Bash command to run'),
       description: z.string().describe('Why I am running this command'),
