@@ -1,4 +1,4 @@
-# file-tools-mcp-server
+# computer-use-mcp-server
 
 An MCP server that faithfully replicates Claude's four built-in computer-use tools — **`view`**, **`create_file`**, **`str_replace`**, and **`bash_tool`** — as standard MCP tools any LLM client can call.
 
@@ -119,9 +119,9 @@ TRANSPORT=http PORT=3000 node dist/index.js
 ```json
 {
   "mcpServers": {
-    "file-tools": {
+    "computer-use": {
       "command": "node",
-      "args": ["/absolute/path/to/file-tools-mcp-server/dist/index.js"]
+      "args": ["/absolute/path/to/computer-use-mcp-server/dist/index.js"]
     }
   }
 }
